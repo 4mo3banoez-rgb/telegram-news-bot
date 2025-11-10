@@ -173,36 +173,21 @@ async function sendNewsToDiscord(mapping, message) {
       return;
     }
 
+    // ОГРАНИЧИВАЕМ размер текста для Discord (2000 символов максимум)
+    const limitedText = messageText.length > 2000 ? messageText.substring(0, 1997) + "..." : messageText;
+
     const embed = new EmbedBuilder()
       .setColor(0x0099FF)
       .setTitle(`📢 ${mapping.name}`)
-      .setDescription(messageText.length > 4096 ? messageText.substring(0, 4093) + "..." : messageText)
+      .setDescription(limitedText)
       .setTimestamp(new Date(message.date * 1000))
       .setFooter({ text: `Источник: ${mapping.telegramChannel}` });
 
-    // Обрабатываем медиафайлы
+    // ВРЕМЕННО ОТКЛЮЧАЕМ медиафайлы чтобы избежать ошибок размера
     let mediaBuffer = null;
-    let mediaFilename = 'media';
 
-    if (message.media) {
-      try {
-        console.log(`📎 Обнаружено медиа в сообщении из ${mapping.telegramChannel}`);
-        mediaBuffer = await telegramClient.downloadMedia(message, {});
-        
-        if (message.photo) {
-          mediaFilename = `photo_${message.id}.jpg`;
-        } else if (message.video) {
-          mediaFilename = `video_${message.id}.mp4`;
-        }
-      } catch (mediaError) {
-        console.error(`❌ Ошибка загрузки медиа:`, mediaError.message);
-      }
-    }
-
+    // Отправляем ТОЛЬКО текст
     const payload = { embeds: [embed] };
-    if (mediaBuffer) {
-      payload.files = [{ attachment: mediaBuffer, name: mediaFilename }];
-    }
 
     await channel.send(payload);
     
@@ -213,7 +198,11 @@ async function sendNewsToDiscord(mapping, message) {
     console.log(`✅ Отправлено в ${mapping.name} (ID: ${messageId})`);
     
   } catch (error) {
-    console.error(`❌ Ошибка отправки в ${mapping.name}:`, error.message);
+    if (error.message.includes('Request entity too large') || error.message.includes('ENOENT')) {
+      console.log(`⚠️ Пропускаем большое сообщение в ${mapping.name}`);
+    } else {
+      console.error(`❌ Ошибка отправки в ${mapping.name}:`, error.message);
+    }
   }
 }
 
@@ -227,7 +216,7 @@ async function checkTelegramChannels() {
     try {
       console.log(`📡 Проверяем: ${mapping.telegramChannel}`);
       const entity = await telegramClient.getEntity(mapping.telegramChannel);
-      const messages = await telegramClient.getMessages(entity, { limit: 3 }); // Уменьшаем лимит для новых сообщений
+      const messages = await telegramClient.getMessages(entity, { limit: 3 });
       
       console.log(`📥 Найдено ${messages.length} сообщений в ${mapping.telegramChannel}`);
       
