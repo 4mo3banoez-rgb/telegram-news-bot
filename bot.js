@@ -14,6 +14,9 @@ const rl = readline.createInterface({
   output: process.stdout
 });
 
+// Файл для хранения обработанных сообщений
+const PROCESSED_MESSAGES_FILE = path.join(__dirname, 'processed_messages.json');
+
 function askQuestion(question) {
   return new Promise((resolve) => {
     rl.question(question, (answer) => {
@@ -64,7 +67,7 @@ const channelMappings = [
 ];
 
 // Хранилище для обработанных сообщений
-const processedMessages = new Set();
+let processedMessages = new Set();
 
 const telegramClient = new TelegramClient(
   new StringSession(process.env.TELEGRAM_SESSION || ""),
@@ -86,6 +89,29 @@ function startHealthServer() {
   });
   
   return server;
+}
+
+// Загружаем обработанные сообщения из файла
+async function loadProcessedMessages() {
+  try {
+    const data = await fs.readFile(PROCESSED_MESSAGES_FILE, 'utf8');
+    const messagesArray = JSON.parse(data);
+    console.log(`📁 Загружено ${messagesArray.length} обработанных сообщений из файла`);
+    return new Set(messagesArray);
+  } catch (error) {
+    console.log('📁 Файл с обработанными сообщениями не найден, создаем новый');
+    return new Set();
+  }
+}
+
+// Сохраняем обработанные сообщения в файл
+async function saveProcessedMessages() {
+  try {
+    const data = JSON.stringify([...processedMessages]);
+    await fs.writeFile(PROCESSED_MESSAGES_FILE, data, 'utf8');
+  } catch (error) {
+    console.error('❌ Ошибка сохранения обработанных сообщений:', error);
+  }
 }
 
 async function connectTelegram() {
@@ -138,7 +164,7 @@ async function sendNewsToDiscord(mapping, message) {
     
     if (!messageText) return;
 
-    // Создаем уникальный ID сообщения
+    // Создаем уникальный ID сообщения (канал + ID + дата)
     const messageId = `${mapping.telegramChannel}_${message.id}_${Math.floor(message.date / 3600)}`;
     
     // Проверяем, не обрабатывали ли уже это сообщение
@@ -180,9 +206,11 @@ async function sendNewsToDiscord(mapping, message) {
 
     await channel.send(payload);
     
-    // Добавляем в обработанные
+    // Добавляем в обработанные и сохраняем
     processedMessages.add(messageId);
-    console.log(`✅ Отправлено в ${mapping.name}`);
+    await saveProcessedMessages();
+    
+    console.log(`✅ Отправлено в ${mapping.name} (ID: ${messageId})`);
     
   } catch (error) {
     console.error(`❌ Ошибка отправки в ${mapping.name}:`, error.message);
@@ -199,7 +227,7 @@ async function checkTelegramChannels() {
     try {
       console.log(`📡 Проверяем: ${mapping.telegramChannel}`);
       const entity = await telegramClient.getEntity(mapping.telegramChannel);
-      const messages = await telegramClient.getMessages(entity, { limit: 5 });
+      const messages = await telegramClient.getMessages(entity, { limit: 3 }); // Уменьшаем лимит для новых сообщений
       
       console.log(`📥 Найдено ${messages.length} сообщений в ${mapping.telegramChannel}`);
       
@@ -234,14 +262,19 @@ process.on('uncaughtException', (error) => {
 
 process.on('SIGINT', () => {
   console.log('🛑 Получен сигнал завершения...');
-  rl.close();
-  process.exit(0);
+  saveProcessedMessages().then(() => {
+    rl.close();
+    process.exit(0);
+  });
 });
 
 // Запуск бота
 async function startBot() {
   try {
     console.log("🤖 Запуск бота...");
+    
+    // Загружаем историю обработанных сообщений
+    processedMessages = await loadProcessedMessages();
     
     // Запускаем HTTP-сервер ДО подключения ботов
     startHealthServer();
@@ -262,6 +295,12 @@ async function startBot() {
       console.log("🕒 Плановая проверка...");
       checkTelegramChannels();
     });
+
+    // Автосохранение каждую минуту
+    setInterval(async () => {
+      await saveProcessedMessages();
+      console.log(`💾 Автосохранение: ${processedMessages.size} сообщений в памяти`);
+    }, 60000);
     
     console.log("🔄 Бот запущен! Проверка каждые 5 минут.");
     
