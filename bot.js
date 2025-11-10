@@ -99,7 +99,7 @@ async function loadProcessedMessages() {
     console.log(`📁 Загружено ${messagesArray.length} обработанных сообщений из файла`);
     return new Set(messagesArray);
   } catch (error) {
-    console.log('📁 Файл с обработанными сообщениями не найден, создаем новый');
+    console.log('📁 Файл с обработанных сообщений не найден, создаем новый');
     return new Set();
   }
 }
@@ -162,7 +162,7 @@ async function sendNewsToDiscord(mapping, message) {
     const channel = await discordClient.channels.fetch(mapping.discordChannelId);
     const messageText = message.message || "";
     
-    if (!messageText) return;
+    if (!messageText && !message.media) return;
 
     // Создаем уникальный ID сообщения (канал + ID + дата)
     const messageId = `${mapping.telegramChannel}_${message.id}_${Math.floor(message.date / 3600)}`;
@@ -179,26 +179,83 @@ async function sendNewsToDiscord(mapping, message) {
     const embed = new EmbedBuilder()
       .setColor(0x0099FF)
       .setTitle(`📢 ${mapping.name}`)
-      .setDescription(limitedText)
       .setTimestamp(new Date(message.date * 1000))
       .setFooter({ text: `Источник: ${mapping.telegramChannel}` });
 
-    // ВРЕМЕННО ОТКЛЮЧАЕМ медиафайлы чтобы избежать ошибок размера
+    // Добавляем текст если он есть
+    if (limitedText) {
+      embed.setDescription(limitedText);
+    }
+
+    // Обрабатываем медиафайлы с ограничениями
     let mediaBuffer = null;
+    let mediaFilename = 'media';
+    let hasMedia = false;
 
-    // Отправляем ТОЛЬКО текст
-    const payload = { embeds: [embed] };
+    if (message.media) {
+      try {
+        console.log(`📎 Обнаружено медиа в сообщении из ${mapping.telegramChannel}`);
+        
+        // Скачиваем медиафайл с ограничением размера
+        mediaBuffer = await telegramClient.downloadMedia(message, {
+          // Ограничиваем размер файла (8MB - лимит Discord)
+          limit: 8 * 1024 * 1024
+        });
+        
+        if (message.photo) {
+          mediaFilename = `photo_${message.id}.jpg`;
+          hasMedia = true;
+          // Добавляем превью фото в embed
+          embed.setImage(`attachment://${mediaFilename}`);
+        } else if (message.video) {
+          mediaFilename = `video_${message.id}.mp4`;
+          hasMedia = true;
+          embed.addFields({ name: '🎥 Видео', value: 'Прикреплено видеофайл' });
+        } else if (message.document) {
+          const docName = message.document.attributes?.find(attr => attr.fileName)?.fileName || `file_${message.id}`;
+          mediaFilename = docName;
+          hasMedia = true;
+          embed.addFields({ name: '📎 Файл', value: docName });
+        }
 
-    await channel.send(payload);
+      } catch (mediaError) {
+        console.error(`❌ Ошибка загрузки медиа из ${mapping.telegramChannel}:`, mediaError.message);
+      }
+    }
+
+    // Отправляем сообщение
+    if (hasMedia && mediaBuffer) {
+      try {
+        // Отправляем embed с медиафайлом
+        const payload = { 
+          embeds: [embed],
+          files: [{ attachment: mediaBuffer, name: mediaFilename }]
+        };
+        await channel.send(payload);
+        console.log(`✅ Отправлено в ${mapping.name} с медиафайлом`);
+      } catch (mediaError) {
+        if (mediaError.message.includes('Request entity too large')) {
+          console.log(`⚠️ Медиафайл слишком большой, отправляем только текст в ${mapping.name}`);
+          // Если файл слишком большой, отправляем только текст
+          await channel.send({ embeds: [embed] });
+        } else {
+          throw mediaError;
+        }
+      }
+    } else {
+      // Отправляем только текст
+      await channel.send({ embeds: [embed] });
+      console.log(`✅ Отправлено в ${mapping.name}`);
+    }
     
     // Добавляем в обработанные и сохраняем
     processedMessages.add(messageId);
     await saveProcessedMessages();
     
-    console.log(`✅ Отправлено в ${mapping.name} (ID: ${messageId})`);
+    console.log(`✅ Успешно обработано: ${mapping.name} (ID: ${messageId})`);
     
   } catch (error) {
-    if (error.message.includes('Request entity too large') || error.message.includes('ENOENT')) {
+    if (error.message.includes('Request entity too large')) {
       console.log(`⚠️ Пропускаем большое сообщение в ${mapping.name}`);
     } else {
       console.error(`❌ Ошибка отправки в ${mapping.name}:`, error.message);
