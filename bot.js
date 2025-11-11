@@ -8,8 +8,7 @@ const path = require('path');
 const http = require('http');
 
 // Файлы для хранения данных
-const PROCESSED_MESSAGES_FILE = path.join(__dirname, 'data', 'processed_messages.json');
-const LAST_CHECK_TIME_FILE = path.join(__dirname, 'data', 'last_check_time.json');
+const BOT_STATE_FILE = path.join(__dirname, 'data', 'bot_state.json');
 
 // Создаем папку data если не существует
 async function ensureDataDirectory() {
@@ -21,9 +20,12 @@ async function ensureDataDirectory() {
   }
 }
 
-// Хранилище для обработанных сообщений
-let processedMessages = new Set();
-let lastCheckTime = Date.now() / 1000 - 3600; // 1 час назад по умолчанию
+// Состояние бота
+let botState = {
+  processedMessages: {},
+  lastMessageIds: {},
+  lastCheckTime: Math.floor(Date.now() / 1000) - 300 // 5 минут назад
+};
 
 const discordClient = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -63,7 +65,7 @@ const telegramClient = new TelegramClient(
     connectionRetries: 3,
     useWSS: false,
     baseLogger: {
-      log: () => {} // Полностью отключаем логи Telegram
+      log: () => {} // Отключаем логи Telegram
     }
   }
 );
@@ -80,11 +82,11 @@ function startHealthServer() {
     const status = {
       status: 'active',
       timestamp: new Date().toISOString(),
-      processed_messages: processedMessages.size,
+      processed_messages: Object.keys(botState.processedMessages).length,
       channels_monitored: channelMappings.length,
       memory_usage: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
       uptime: `${Math.floor(process.uptime())}s`,
-      last_check: new Date(lastCheckTime * 1000).toISOString()
+      last_check: new Date(botState.lastCheckTime * 1000).toISOString()
     };
     
     res.end(JSON.stringify(status, null, 2));
@@ -98,53 +100,57 @@ function startHealthServer() {
   return server;
 }
 
-// Загружаем обработанные сообщения
-async function loadProcessedMessages() {
+// Загружаем состояние бота
+async function loadBotState() {
   try {
     await ensureDataDirectory();
-    const data = await fs.readFile(PROCESSED_MESSAGES_FILE, 'utf8');
-    const messagesArray = JSON.parse(data);
-    console.log(`📁 Загружено ${messagesArray.length} обработанных сообщений`);
-    return new Set(messagesArray);
+    const data = await fs.readFile(BOT_STATE_FILE, 'utf8');
+    const savedState = JSON.parse(data);
+    console.log(`📁 Загружено состояние: ${Object.keys(savedState.processedMessages || {}).length} сообщений`);
+    
+    // Миграция старых данных
+    if (Array.isArray(savedState.processedMessages)) {
+      const newProcessed = {};
+      savedState.processedMessages.forEach(msgId => {
+        newProcessed[msgId] = true;
+      });
+      savedState.processedMessages = newProcessed;
+    }
+    
+    return {
+      processedMessages: savedState.processedMessages || {},
+      lastMessageIds: savedState.lastMessageIds || {},
+      lastCheckTime: savedState.lastCheckTime || Math.floor(Date.now() / 1000) - 300
+    };
   } catch (error) {
-    console.log('📁 Файл с обработанных сообщений не найден, создаем новый');
-    return new Set();
+    console.log('📁 Файл состояния не найден, создаем новый');
+    return {
+      processedMessages: {},
+      lastMessageIds: {},
+      lastCheckTime: Math.floor(Date.now() / 1000) - 300
+    };
   }
 }
 
-// Загружаем время последней проверки
-async function loadLastCheckTime() {
+// Сохраняем состояние бота
+async function saveBotState() {
   try {
     await ensureDataDirectory();
-    const data = await fs.readFile(LAST_CHECK_TIME_FILE, 'utf8');
-    const timeData = JSON.parse(data);
-    console.log(`📁 Последняя проверка: ${new Date(timeData.lastCheckTime * 1000).toISOString()}`);
-    return timeData.lastCheckTime;
+    
+    // Очищаем старые записи (храним только последние 1000 сообщений)
+    const messageKeys = Object.keys(botState.processedMessages);
+    if (messageKeys.length > 1000) {
+      const toRemove = messageKeys.slice(0, messageKeys.length - 1000);
+      toRemove.forEach(key => {
+        delete botState.processedMessages[key];
+      });
+      console.log(`🧹 Очищено ${toRemove.length} старых сообщений`);
+    }
+    
+    const data = JSON.stringify(botState, null, 2);
+    await fs.writeFile(BOT_STATE_FILE, data, 'utf8');
   } catch (error) {
-    console.log('📁 Файл времени проверки не найден, используем текущее время');
-    return Date.now() / 1000 - 3600; // 1 час назад
-  }
-}
-
-// Сохраняем обработанные сообщения
-async function saveProcessedMessages() {
-  try {
-    await ensureDataDirectory();
-    const data = JSON.stringify([...processedMessages]);
-    await fs.writeFile(PROCESSED_MESSAGES_FILE, data, 'utf8');
-  } catch (error) {
-    console.error('❌ Ошибка сохранения сообщений:', error.message);
-  }
-}
-
-// Сохраняем время последней проверки
-async function saveLastCheckTime() {
-  try {
-    await ensureDataDirectory();
-    const data = JSON.stringify({ lastCheckTime });
-    await fs.writeFile(LAST_CHECK_TIME_FILE, data, 'utf8');
-  } catch (error) {
-    console.error('❌ Ошибка сохранения времени:', error.message);
+    console.error('❌ Ошибка сохранения состояния:', error.message);
   }
 }
 
@@ -156,7 +162,7 @@ async function downloadMediaSafe(message, timeoutMs = 5000) {
     }, timeoutMs);
 
     telegramClient.downloadMedia(message, {
-      limit: 3 * 1024 * 1024, // 3MB максимум
+      limit: 3 * 1024 * 1024,
     })
     .then(mediaBuffer => {
       clearTimeout(timeout);
@@ -193,7 +199,6 @@ async function sendNewsToDiscord(mapping, message) {
     const messageText = message.message || "";
     
     if (!messageText && !message.media) {
-      console.log(`⏭️ Пустое сообщение из ${mapping.name}`);
       return;
     }
 
@@ -201,8 +206,7 @@ async function sendNewsToDiscord(mapping, message) {
     const messageId = `${mapping.telegramChannel}_${message.id}`;
     
     // Проверяем, не обрабатывали ли уже это сообщение
-    if (processedMessages.has(messageId)) {
-      console.log(`⏭️ Пропускаем уже обработанное сообщение: ${mapping.name}`);
+    if (botState.processedMessages[messageId]) {
       return;
     }
 
@@ -215,37 +219,28 @@ async function sendNewsToDiscord(mapping, message) {
       .setTimestamp(new Date(message.date * 1000))
       .setFooter({ text: `Источник: ${mapping.telegramChannel}` });
 
-    // Добавляем текст если он есть
     if (limitedText) {
       embed.setDescription(limitedText);
     }
 
-    // Безопасная обработка медиафайлов
+    // Обработка медиа
     let mediaBuffer = null;
     let hasMedia = false;
 
     if (message.media) {
       try {
-        console.log(`📎 Пытаемся загрузить медиа из ${mapping.name}`);
-        
-        // Пробуем загрузить медиа с таймаутом
         mediaBuffer = await downloadMediaSafe(message, 5000);
         
         if (mediaBuffer && mediaBuffer.length > 0 && mediaBuffer.length < 8 * 1024 * 1024) {
           hasMedia = true;
           
-          // Определяем тип медиа
           if (message.photo) {
             embed.setImage('attachment://photo.jpg');
           } else if (message.video) {
             embed.addFields({ name: '🎥 Видео', value: 'Прикреплено видео' });
-          } else if (message.document) {
-            const docName = message.document.attributes?.find(attr => attr.fileName)?.fileName || 'файл';
-            embed.addFields({ name: '📎 Документ', value: docName });
           }
         }
       } catch (mediaError) {
-        console.log(`⚠️ Не удалось загрузить медиа из ${mapping.name}`);
         // Продолжаем без медиа
       }
     }
@@ -253,29 +248,24 @@ async function sendNewsToDiscord(mapping, message) {
     // Отправляем сообщение
     try {
       if (hasMedia && mediaBuffer) {
-        let filename = 'media';
-        if (message.photo) filename = 'photo.jpg';
-        else if (message.video) filename = 'video.mp4';
-        
+        let filename = message.photo ? 'photo.jpg' : 'video.mp4';
         await channel.send({ 
           embeds: [embed],
           files: [{ attachment: mediaBuffer, name: filename }]
         });
-        console.log(`✅ Отправлено в ${mapping.name} с медиа`);
       } else {
         await channel.send({ embeds: [embed] });
-        console.log(`✅ Отправлено в ${mapping.name} (текст)`);
       }
       
-      // Добавляем в обработанные
-      processedMessages.add(messageId);
+      // ОТМЕЧАЕМ КАК ОБРАБОТАННОЕ ПЕРЕД СОХРАНЕНИЕМ
+      botState.processedMessages[messageId] = true;
+      botState.lastMessageIds[mapping.telegramChannel] = message.id;
+      
+      console.log(`✅ Отправлено в ${mapping.name} (ID: ${message.id})`);
       
     } catch (error) {
       if (error.message.includes('Request entity too large')) {
-        console.log(`⚠️ Файл слишком большой для Discord, отправляем без медиа в ${mapping.name}`);
         await channel.send({ embeds: [embed] });
-      } else {
-        console.log(`❌ Ошибка отправки в ${mapping.name}: ${error.message}`);
       }
     }
     
@@ -287,56 +277,54 @@ async function sendNewsToDiscord(mapping, message) {
 async function checkTelegramChannels() {
   console.log("🔍 Начинаем проверку каналов...");
   
+  const currentCheckTime = Math.floor(Date.now() / 1000);
   let newMessages = 0;
-  let skippedMessages = 0;
-  let errorChannels = 0;
-  
-  // Сохраняем время начала проверки
-  const currentCheckTime = Date.now() / 1000;
+  let totalMessages = 0;
   
   for (const mapping of channelMappings) {
     try {
       console.log(`📡 Проверяем: ${mapping.telegramChannel}`);
       const entity = await telegramClient.getEntity(mapping.telegramChannel);
       
-      // Получаем сообщения с момента последней проверки
-      const messages = await telegramClient.getMessages(entity, {
-        limit: 10,
-        offsetDate: lastCheckTime
-      });
+      // Получаем только последние 5 сообщений
+      const messages = await telegramClient.getMessages(entity, { limit: 5 });
       
-      console.log(`📥 Найдено ${messages.length} новых сообщений в ${mapping.telegramChannel}`);
+      console.log(`📥 Найдено ${messages.length} сообщений в ${mapping.telegramChannel}`);
       
       // СОРТИРУЕМ по дате (старые первыми)
       const sortedMessages = messages.sort((a, b) => a.date - b.date);
       
       for (const message of sortedMessages) {
+        totalMessages++;
         const messageId = `${mapping.telegramChannel}_${message.id}`;
         
-        if (processedMessages.has(messageId)) {
-          skippedMessages++;
+        // Пропускаем если уже обработано
+        if (botState.processedMessages[messageId]) {
           continue;
         }
         
-        await sendNewsToDiscord(mapping, message);
-        newMessages++;
-        
-        // Задержка между сообщениями
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        // Отправляем только если сообщение новее последней проверки
+        if (message.date > botState.lastCheckTime - 600) { // 10 минут запас
+          await sendNewsToDiscord(mapping, message);
+          newMessages++;
+          
+          // Задержка между сообщениями
+          await new Promise(resolve => setTimeout(resolve, 800));
+        }
       }
     } catch (error) {
-      errorChannels++;
       console.log(`❌ Ошибка канала ${mapping.telegramChannel}: ${error.message}`);
     }
   }
   
-  // Обновляем время последней проверки
-  lastCheckTime = currentCheckTime;
-  await saveLastCheckTime();
-  await saveProcessedMessages();
+  // ОБНОВЛЯЕМ ВРЕМЯ ПОСЛЕ УСПЕШНОЙ ПРОВЕРКИ
+  botState.lastCheckTime = currentCheckTime;
   
-  console.log(`📊 Итог: новых - ${newMessages}, пропущено - ${skippedMessages}, ошибок - ${errorChannels}`);
-  console.log(`⏰ Следующая проверка с: ${new Date(lastCheckTime * 1000).toISOString()}`);
+  // СОХРАНЯЕМ СОСТОЯНИЕ
+  await saveBotState();
+  
+  console.log(`📊 Итог: новых - ${newMessages}, всего - ${totalMessages}`);
+  console.log(`⏰ Следующая проверка с: ${new Date(botState.lastCheckTime * 1000).toISOString()}`);
 }
 
 // Обработчики ошибок
@@ -353,9 +341,8 @@ async function startBot() {
   try {
     console.log("🤖 Запуск бота...");
     
-    // Загружаем историю
-    processedMessages = await loadProcessedMessages();
-    lastCheckTime = await loadLastCheckTime();
+    // Загружаем состояние
+    botState = await loadBotState();
     
     // Запускаем HTTP-сервер
     startHealthServer();
@@ -368,28 +355,29 @@ async function startBot() {
     const telegramConnected = await connectTelegram();
     
     if (!telegramConnected) {
-      console.log("⏸️ Telegram не подключен, работаем только в режиме ожидания");
+      console.log("⏸️ Telegram не подключен");
       return;
     }
     
-    // Первая проверка через 5 секунд
+    // Первая проверка
     setTimeout(async () => {
       await checkTelegramChannels();
-    }, 5000);
+    }, 3000);
     
-    // Планировщик - проверка каждые 2 минуты (чаще для тестирования)
-    cron.schedule('*/2 * * * *', () => {
+    // Планировщик - проверка каждые 3 минуты
+    cron.schedule('*/3 * * * *', async () => {
       console.log("🕒 Плановая проверка...");
-      checkTelegramChannels();
+      await checkTelegramChannels();
     });
 
-    // Автосохранение каждые 30 секунд
+    // Автосохранение каждую минуту
     setInterval(async () => {
-      await saveProcessedMessages();
-    }, 30000);
+      await saveBotState();
+    }, 60000);
     
-    console.log("🔄 Бот запущен! Проверка каждые 2 минуты.");
-    console.log("🕒 Отслеживаем сообщения с:", new Date(lastCheckTime * 1000).toISOString());
+    console.log("🔄 Бот запущен! Проверка каждые 3 минуты.");
+    console.log(`📊 Обработано сообщений: ${Object.keys(botState.processedMessages).length}`);
+    console.log(`🕒 Отслеживаем с: ${new Date(botState.lastCheckTime * 1000).toISOString()}`);
     
   } catch (error) {
     console.log('❌ Ошибка запуска:', error.message);
