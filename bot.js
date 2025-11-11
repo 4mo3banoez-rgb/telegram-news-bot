@@ -22,8 +22,8 @@ async function ensureDataDirectory() {
 
 // Состояние бота
 let botState = {
-  lastGlobalTime: Math.floor(Date.now() / 1000) - 3600, // 1 час назад
-  processedMessages: {} // messageId -> true
+  lastGlobalTime: Math.floor(Date.now() / 1000) - 3600,
+  processedMessages: {}
 };
 
 const discordClient = new Client({
@@ -64,7 +64,7 @@ const telegramClient = new TelegramClient(
     connectionRetries: 3,
     useWSS: false,
     baseLogger: {
-      log: () => {} // Отключаем логи Telegram
+      log: () => {}
     }
   }
 );
@@ -121,7 +121,6 @@ async function saveBotState() {
     await ensureDataDirectory();
     const data = JSON.stringify(botState, null, 2);
     await fs.writeFile(BOT_STATE_FILE, data, 'utf8');
-    console.log(`💾 Сохранено состояние, обработано сообщений: ${Object.keys(botState.processedMessages).length}`);
   } catch (error) {
     console.error('❌ Ошибка сохранения состояния:', error.message);
   }
@@ -175,7 +174,6 @@ async function sendMessageToDiscord(mapping, message) {
       return false;
     }
 
-    // Ограничиваем текст
     const limitedText = messageText.length > 2000 ? messageText.substring(0, 1997) + "..." : messageText;
 
     const embed = new EmbedBuilder()
@@ -185,24 +183,19 @@ async function sendMessageToDiscord(mapping, message) {
       .setTimestamp(new Date(message.date * 1000))
       .setFooter({ text: `Источник: ${mapping.telegramChannel}` });
 
-    // Обработка медиа
     let mediaBuffer = null;
     let hasMedia = false;
 
     if (message.media && message.photo) {
       try {
         mediaBuffer = await downloadMediaSafe(message, 5000);
-        
         if (mediaBuffer && mediaBuffer.length > 0 && mediaBuffer.length < 8 * 1024 * 1024) {
           hasMedia = true;
           embed.setImage('attachment://photo.jpg');
         }
-      } catch (mediaError) {
-        // Продолжаем без медиа
-      }
+      } catch (mediaError) {}
     }
 
-    // Отправляем сообщение
     try {
       if (hasMedia && mediaBuffer) {
         await channel.send({ 
@@ -218,12 +211,12 @@ async function sendMessageToDiscord(mapping, message) {
       return true;
       
     } catch (error) {
-      console.log(`❌ Ошибка отправки: ${mapping.name} - ${error.message}`);
+      console.log(`❌ Ошибка отправки: ${mapping.name}`);
       return false;
     }
     
   } catch (error) {
-    console.log(`❌ Ошибка: ${mapping.name} - ${error.message}`);
+    console.log(`❌ Ошибка: ${mapping.name}`);
     return false;
   }
 }
@@ -240,16 +233,14 @@ async function checkTelegramChannels() {
     try {
       const entity = await telegramClient.getEntity(mapping.telegramChannel);
       
-      // Получаем сообщения после последнего глобального времени
       const messages = await telegramClient.getMessages(entity, {
-        limit: 20, // Больше сообщений для лучшего перемешивания
+        limit: 10,
         offsetDate: botState.lastGlobalTime
       });
       
-      console.log(`📥 ${mapping.name}: ${messages.length} новых сообщений`);
+      console.log(`📥 ${mapping.name}: ${messages.length} сообщений`);
       
       for (const message of messages) {
-        // Проверяем что сообщение новое и не пустое
         const messageId = `${mapping.telegramChannel}_${message.id}`;
         
         if (!botState.processedMessages[messageId] && (message.message || message.media)) {
@@ -259,7 +250,6 @@ async function checkTelegramChannels() {
             timestamp: message.date
           });
           
-          // Обновляем максимальное время
           if (message.date > maxMessageTime) {
             maxMessageTime = message.date;
           }
@@ -275,49 +265,92 @@ async function checkTelegramChannels() {
     return;
   }
   
-  // 2. СОРТИРУЕМ по времени (от старых к новым) - ВАЖНО!
+  // 2. СОРТИРУЕМ по времени (от старых к новым)
   allMessages.sort((a, b) => a.timestamp - b.timestamp);
   
-  console.log(`🔄 Найдено ${allMessages.length} новых сообщений, отправляем в хронологическом порядке:`);
+  console.log(`🔄 Найдено ${allMessages.length} новых сообщений`);
   
-  // 3. Отправляем в правильном порядке
+  // 3. ПРИНУДИТЕЛЬНО ПЕРЕМЕШИВАЕМ сообщения в пределах временных групп
+  const shuffledMessages = shuffleWithinTimeGroups(allMessages);
+  
+  console.log("📨 Отправляем в перемешанном порядке:");
+  
+  // 4. Отправляем в перемешанном порядке
   let sentCount = 0;
-  for (const item of allMessages) {
+  for (const item of shuffledMessages) {
     const messageId = `${item.mapping.telegramChannel}_${item.message.id}`;
     const messageTime = new Date(item.timestamp * 1000).toLocaleTimeString();
     
-    console.log(`   📨 ${item.mapping.name} - ${messageTime}`);
+    console.log(`   ${item.mapping.name} - ${messageTime}`);
     
     const success = await sendMessageToDiscord(item.mapping, item.message);
     
     if (success) {
       sentCount++;
-      // Помечаем как обработанное
       botState.processedMessages[messageId] = true;
-      
-      // Задержка между сообщениями
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
   }
   
-  // 4. Обновляем глобальное время только если нашли новые сообщения
+  // 5. Обновляем глобальное время
   if (maxMessageTime > botState.lastGlobalTime) {
     botState.lastGlobalTime = maxMessageTime;
   }
   
-  // 5. Сохраняем состояние
   await saveBotState();
   
-  console.log(`🎉 Успешно отправлено ${sentCount} сообщений`);
-  console.log(`⏰ Теперь отслеживаем с: ${new Date(botState.lastGlobalTime * 1000).toISOString()}`);
+  console.log(`🎉 Отправлено ${sentCount} сообщений в перемешанном порядке`);
 }
 
-// Очистка старых processedMessages (чтобы файл не рос бесконечно)
+// Функция для перемешивания сообщений в пределах временных групп
+function shuffleWithinTimeGroups(messages) {
+  if (messages.length <= 1) return messages;
+  
+  // Группируем сообщения по временным интервалам (5 минут)
+  const timeGroups = {};
+  const TIME_WINDOW = 300; // 5 минут в секундах
+  
+  messages.forEach(msg => {
+    const timeGroup = Math.floor(msg.timestamp / TIME_WINDOW) * TIME_WINDOW;
+    if (!timeGroups[timeGroup]) {
+      timeGroups[timeGroup] = [];
+    }
+    timeGroups[timeGroup].push(msg);
+  });
+  
+  // Перемешиваем каждую группу и объединяем
+  const result = [];
+  const sortedTimeGroups = Object.keys(timeGroups).sort((a, b) => a - b);
+  
+  sortedTimeGroups.forEach(timeGroup => {
+    const groupMessages = timeGroups[timeGroup];
+    
+    // Если в группе больше 1 сообщения - перемешиваем
+    if (groupMessages.length > 1) {
+      shuffleArray(groupMessages);
+    }
+    
+    result.push(...groupMessages);
+  });
+  
+  console.log(`🔀 Перемешано ${Object.keys(timeGroups).length} временных групп`);
+  return result;
+}
+
+// Функция для перемешивания массива (Fisher-Yates shuffle)
+function shuffleArray(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
+}
+
+// Очистка старых processedMessages
 function cleanupProcessedMessages() {
   const messageIds = Object.keys(botState.processedMessages);
-  if (messageIds.length > 5000) {
-    // Оставляем только последние 3000 сообщений
-    const toDelete = messageIds.slice(0, messageIds.length - 3000);
+  if (messageIds.length > 3000) {
+    const toDelete = messageIds.slice(0, messageIds.length - 2000);
     toDelete.forEach(id => {
       delete botState.processedMessages[id];
     });
@@ -339,43 +372,30 @@ async function startBot() {
   try {
     console.log("🤖 Запуск бота...");
     
-    // Загружаем состояние
     botState = await loadBotState();
-    
-    // Запускаем HTTP-сервер
     startHealthServer();
     
-    // Подключаем Discord
     await discordClient.login(process.env.DISCORD_TOKEN);
     console.log(`✅ Discord подключен: ${discordClient.user.tag}`);
     
-    // Подключаем Telegram
     const telegramConnected = await connectTelegram();
+    if (!telegramConnected) return;
     
-    if (!telegramConnected) {
-      console.log("⏸️ Telegram не подключен");
-      return;
-    }
-    
-    // Первая проверка через 5 секунд
     setTimeout(async () => {
       await checkTelegramChannels();
     }, 5000);
     
-    // Планировщик - проверка каждые 2 минуты
     cron.schedule('*/2 * * * *', async () => {
       console.log("🕒 Плановая проверка...");
       cleanupProcessedMessages();
       await checkTelegramChannels();
     });
 
-    // Автосохранение каждую минуту
     setInterval(async () => {
       await saveBotState();
     }, 60000);
     
     console.log("🔄 Бот запущен! Проверка каждые 2 минуты.");
-    console.log(`📊 Отслеживаем ${channelMappings.length} каналов`);
     
   } catch (error) {
     console.log('❌ Ошибка запуска:', error.message);
