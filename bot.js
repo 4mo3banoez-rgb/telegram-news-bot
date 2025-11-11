@@ -22,8 +22,8 @@ async function ensureDataDirectory() {
 
 // Состояние бота
 let botState = {
-  lastProcessedIds: {}, // Для каждого канала храним последний ID
-  lastCheckTime: Math.floor(Date.now() / 1000) - 3600
+  lastCheckTime: Math.floor(Date.now() / 1000) - 7200, // 2 часа назад
+  processedMessages: {}
 };
 
 const discordClient = new Client({
@@ -83,7 +83,8 @@ function startHealthServer() {
       timestamp: new Date().toISOString(),
       channels_monitored: channelMappings.length,
       memory_usage: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
-      uptime: `${Math.floor(process.uptime())}s`
+      uptime: `${Math.floor(process.uptime())}s`,
+      processed_messages: Object.keys(botState.processedMessages).length
     };
     
     res.end(JSON.stringify(status, null, 2));
@@ -103,13 +104,13 @@ async function loadBotState() {
     await ensureDataDirectory();
     const data = await fs.readFile(BOT_STATE_FILE, 'utf8');
     const state = JSON.parse(data);
-    console.log(`📁 Загружено состояние для ${Object.keys(state.lastProcessedIds || {}).length} каналов`);
+    console.log(`📁 Загружено состояние, обработано сообщений: ${Object.keys(state.processedMessages || {}).length}`);
     return state;
   } catch (error) {
     console.log('📁 Файл состояния не найден, создаем новый');
     return {
-      lastProcessedIds: {},
-      lastCheckTime: Math.floor(Date.now() / 1000) - 3600
+      lastCheckTime: Math.floor(Date.now() / 1000) - 7200,
+      processedMessages: {}
     };
   }
 }
@@ -222,28 +223,34 @@ async function sendMessageToDiscord(mapping, message) {
 
 async function checkTelegramChannels() {
   console.log("🔍 Начинаем проверку каналов...");
+  console.log(`⏰ Ищем сообщения за последние 2 часа...`);
   
   const allMessages = [];
-  const currentCheckTime = Math.floor(Date.now() / 1000);
+  const currentTime = Math.floor(Date.now() / 1000);
+  const twoHoursAgo = currentTime - 7200;
 
-  // 1. Собираем ВСЕ новые сообщения со всех каналов
+  // 1. Собираем ВСЕ сообщения за последние 2 часа
   for (const mapping of channelMappings) {
     try {
       const entity = await telegramClient.getEntity(mapping.telegramChannel);
       
-      // Получаем последние 5 сообщений
-      const messages = await telegramClient.getMessages(entity, { limit: 5 });
+      // Получаем сообщения за последние 2 часа
+      const messages = await telegramClient.getMessages(entity, {
+        limit: 50, // Больше сообщений для лучшего перемешивания
+        offsetDate: twoHoursAgo
+      });
       
-      console.log(`📥 ${mapping.name}: ${messages.length} сообщений`);
-      
-      const lastId = botState.lastProcessedIds[mapping.telegramChannel] || 0;
+      console.log(`📥 ${mapping.name}: ${messages.length} сообщений за 2 часа`);
       
       for (const message of messages) {
-        // Проверяем что сообщение новое
-        if (message.id > lastId && (message.message || message.media)) {
+        const messageId = `${mapping.telegramChannel}_${message.id}`;
+        
+        // Проверяем что сообщение не пустое и еще не обработано
+        if (!botState.processedMessages[messageId] && (message.message || message.media)) {
           allMessages.push({
             mapping: mapping,
-            message: message
+            message: message,
+            timestamp: message.date
           });
         }
       }
@@ -257,34 +264,36 @@ async function checkTelegramChannels() {
     return;
   }
   
-  console.log(`🔄 Найдено ${allMessages.length} новых сообщений`);
+  console.log(`🔄 Найдено ${allMessages.length} сообщений за 2 часа`);
   
   // 2. ПЕРЕМЕШИВАЕМ ВСЕ сообщения СЛУЧАЙНЫМ образом
   const shuffledMessages = shuffleArray([...allMessages]);
   
   console.log("🎲 Отправляем в СЛУЧАЙНОМ порядке:");
   shuffledMessages.forEach((item, index) => {
-    const time = new Date(item.message.date * 1000).toLocaleTimeString();
+    const time = new Date(item.timestamp * 1000).toLocaleTimeString();
     console.log(`   ${index + 1}. ${item.mapping.name} - ${time}`);
   });
   
   // 3. Отправляем в СЛУЧАЙНОМ порядке
   let sentCount = 0;
   for (const item of shuffledMessages) {
+    const messageId = `${item.mapping.telegramChannel}_${item.message.id}`;
+    
     const success = await sendMessageToDiscord(item.mapping, item.message);
     
     if (success) {
       sentCount++;
-      // Обновляем последний ID для этого канала
-      botState.lastProcessedIds[item.mapping.telegramChannel] = item.message.id;
+      // Помечаем как обработанное
+      botState.processedMessages[messageId] = true;
       
       // Задержка между сообщениями
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await new Promise(resolve => setTimeout(resolve, 1500));
     }
   }
   
   // 4. Обновляем время проверки
-  botState.lastCheckTime = currentCheckTime;
+  botState.lastCheckTime = currentTime;
   
   // 5. Сохраняем состояние
   await saveBotState();
@@ -300,6 +309,18 @@ function shuffleArray(array) {
     [newArray[i], newArray[j]] = [newArray[j], newArray[i]];
   }
   return newArray;
+}
+
+// Очистка старых processedMessages
+function cleanupProcessedMessages() {
+  const messageIds = Object.keys(botState.processedMessages);
+  if (messageIds.length > 5000) {
+    const toDelete = messageIds.slice(0, messageIds.length - 3000);
+    toDelete.forEach(id => {
+      delete botState.processedMessages[id];
+    });
+    console.log(`🧹 Очищено ${toDelete.length} старых записей`);
+  }
 }
 
 // Обработчики ошибок
@@ -329,8 +350,9 @@ async function startBot() {
       await checkTelegramChannels();
     }, 5000);
     
-    cron.schedule('*/3 * * * *', async () => {
+    cron.schedule('*/5 * * * *', async () => {
       console.log("🕒 Плановая проверка...");
+      cleanupProcessedMessages();
       await checkTelegramChannels();
     });
 
@@ -338,7 +360,7 @@ async function startBot() {
       await saveBotState();
     }, 60000);
     
-    console.log("🔄 Бот запущен! Проверка каждые 3 минуты.");
+    console.log("🔄 Бот запущен! Проверка каждые 5 минут.");
     
   } catch (error) {
     console.log('❌ Ошибка запуска:', error.message);
