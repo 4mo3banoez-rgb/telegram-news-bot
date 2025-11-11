@@ -165,7 +165,7 @@ async function sendNewsToDiscord(mapping, message) {
     const messageText = message.message || "";
     
     if (!messageText && !message.media) {
-      return;
+      return false;
     }
 
     // Ограничиваем текст
@@ -215,7 +215,7 @@ async function sendNewsToDiscord(mapping, message) {
         await channel.send({ embeds: [embed] });
       }
       
-      console.log(`✅ Отправлено в ${mapping.name} (ID: ${message.id})`);
+      console.log(`✅ Отправлено из ${mapping.name} (ID: ${message.id}, дата: ${new Date(message.date * 1000).toISOString()})`);
       return true;
       
     } catch (error) {
@@ -236,12 +236,13 @@ async function sendNewsToDiscord(mapping, message) {
 async function checkTelegramChannels() {
   console.log("🔍 Начинаем проверку каналов...");
   
-  let newMessages = 0;
+  let allNewMessages = [];
   let totalChecked = 0;
   
+  // 1. Собираем все новые сообщения со всех каналов
   for (const mapping of channelMappings) {
     try {
-      console.log(`📡 Проверяем: ${mapping.telegramChannel}`);
+      console.log(`📡 Собираем сообщения из: ${mapping.telegramChannel}`);
       const entity = await telegramClient.getEntity(mapping.telegramChannel);
       
       // Получаем только 3 последних сообщения
@@ -249,26 +250,18 @@ async function checkTelegramChannels() {
       
       console.log(`📥 Найдено ${messages.length} сообщений в ${mapping.telegramChannel}`);
       
-      // Сортируем от старых к новым
-      const sortedMessages = messages.sort((a, b) => a.date - b.date);
+      const lastId = lastMessageIds[mapping.telegramChannel] || 0;
       
-      for (const message of sortedMessages) {
+      for (const message of messages) {
         totalChecked++;
         
-        const lastId = lastMessageIds[mapping.telegramChannel] || 0;
-        
-        // Отправляем только если сообщение новее последнего обработанного
+        // Добавляем только новые сообщения
         if (message.id > lastId) {
-          const success = await sendNewsToDiscord(mapping, message);
-          
-          if (success) {
-            newMessages++;
-            // СРАЗУ обновляем последний ID для этого канала
-            lastMessageIds[mapping.telegramChannel] = message.id;
-          }
-          
-          // Задержка между сообщениями
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          allNewMessages.push({
+            mapping: mapping,
+            message: message,
+            timestamp: message.date
+          });
         }
       }
     } catch (error) {
@@ -276,11 +269,40 @@ async function checkTelegramChannels() {
     }
   }
   
-  // СОХРАНЯЕМ последние ID после проверки ВСЕХ каналов
+  console.log(`📊 Собрано ${allNewMessages.length} новых сообщений из ${totalChecked} проверенных`);
+  
+  if (allNewMessages.length === 0) {
+    console.log("⏭️ Новых сообщений нет");
+    return;
+  }
+  
+  // 2. СОРТИРУЕМ ВСЕ сообщения по дате (от старых к новым)
+  allNewMessages.sort((a, b) => a.timestamp - b.timestamp);
+  
+  console.log("🔄 Отправляем сообщения в хронологическом порядке:");
+  allNewMessages.forEach((item, index) => {
+    console.log(`   ${index + 1}. ${item.mapping.name} - ${new Date(item.timestamp * 1000).toISOString()}`);
+  });
+  
+  // 3. Отправляем сообщения в правильном порядке
+  let sentCount = 0;
+  for (const item of allNewMessages) {
+    const success = await sendNewsToDiscord(item.mapping, item.message);
+    
+    if (success) {
+      sentCount++;
+      // Обновляем последний ID для этого канала
+      lastMessageIds[item.mapping.telegramChannel] = item.message.id;
+      
+      // Задержка между сообщениями
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+  
+  // 4. Сохраняем последние ID после отправки ВСЕХ сообщений
   await saveLastIds();
   
-  console.log(`📊 Итог: новых - ${newMessages}, проверено - ${totalChecked}`);
-  console.log(`💾 Сохранены ID для ${Object.keys(lastMessageIds).length} каналов`);
+  console.log(`🎉 Отправлено ${sentCount} сообщений в хронологическом порядке`);
 }
 
 // Обработчики ошибок
