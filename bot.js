@@ -22,8 +22,8 @@ async function ensureDataDirectory() {
 
 // Состояние бота
 let botState = {
-  lastGlobalTime: Math.floor(Date.now() / 1000) - 3600,
-  processedMessages: {}
+  lastProcessedIds: {}, // Для каждого канала храним последний ID
+  lastCheckTime: Math.floor(Date.now() / 1000) - 3600
 };
 
 const discordClient = new Client({
@@ -83,8 +83,7 @@ function startHealthServer() {
       timestamp: new Date().toISOString(),
       channels_monitored: channelMappings.length,
       memory_usage: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`,
-      uptime: `${Math.floor(process.uptime())}s`,
-      last_global_time: new Date(botState.lastGlobalTime * 1000).toISOString()
+      uptime: `${Math.floor(process.uptime())}s`
     };
     
     res.end(JSON.stringify(status, null, 2));
@@ -104,13 +103,13 @@ async function loadBotState() {
     await ensureDataDirectory();
     const data = await fs.readFile(BOT_STATE_FILE, 'utf8');
     const state = JSON.parse(data);
-    console.log(`📁 Загружено состояние, последнее время: ${new Date(state.lastGlobalTime * 1000).toISOString()}`);
+    console.log(`📁 Загружено состояние для ${Object.keys(state.lastProcessedIds || {}).length} каналов`);
     return state;
   } catch (error) {
     console.log('📁 Файл состояния не найден, создаем новый');
     return {
-      lastGlobalTime: Math.floor(Date.now() / 1000) - 3600,
-      processedMessages: {}
+      lastProcessedIds: {},
+      lastCheckTime: Math.floor(Date.now() / 1000) - 3600
     };
   }
 }
@@ -223,36 +222,29 @@ async function sendMessageToDiscord(mapping, message) {
 
 async function checkTelegramChannels() {
   console.log("🔍 Начинаем проверку каналов...");
-  console.log(`⏰ Ищем сообщения после: ${new Date(botState.lastGlobalTime * 1000).toISOString()}`);
   
   const allMessages = [];
-  let maxMessageTime = botState.lastGlobalTime;
+  const currentCheckTime = Math.floor(Date.now() / 1000);
 
-  // 1. Собираем ВСЕ сообщения после последнего глобального времени
+  // 1. Собираем ВСЕ новые сообщения со всех каналов
   for (const mapping of channelMappings) {
     try {
       const entity = await telegramClient.getEntity(mapping.telegramChannel);
       
-      const messages = await telegramClient.getMessages(entity, {
-        limit: 10,
-        offsetDate: botState.lastGlobalTime
-      });
+      // Получаем последние 5 сообщений
+      const messages = await telegramClient.getMessages(entity, { limit: 5 });
       
       console.log(`📥 ${mapping.name}: ${messages.length} сообщений`);
       
+      const lastId = botState.lastProcessedIds[mapping.telegramChannel] || 0;
+      
       for (const message of messages) {
-        const messageId = `${mapping.telegramChannel}_${message.id}`;
-        
-        if (!botState.processedMessages[messageId] && (message.message || message.media)) {
+        // Проверяем что сообщение новое
+        if (message.id > lastId && (message.message || message.media)) {
           allMessages.push({
             mapping: mapping,
-            message: message,
-            timestamp: message.date
+            message: message
           });
-          
-          if (message.date > maxMessageTime) {
-            maxMessageTime = message.date;
-          }
         }
       }
     } catch (error) {
@@ -265,97 +257,49 @@ async function checkTelegramChannels() {
     return;
   }
   
-  // 2. СОРТИРУЕМ по времени (от старых к новым)
-  allMessages.sort((a, b) => a.timestamp - b.timestamp);
-  
   console.log(`🔄 Найдено ${allMessages.length} новых сообщений`);
   
-  // 3. ПРИНУДИТЕЛЬНО ПЕРЕМЕШИВАЕМ сообщения в пределах временных групп
-  const shuffledMessages = shuffleWithinTimeGroups(allMessages);
+  // 2. ПЕРЕМЕШИВАЕМ ВСЕ сообщения СЛУЧАЙНЫМ образом
+  const shuffledMessages = shuffleArray([...allMessages]);
   
-  console.log("📨 Отправляем в перемешанном порядке:");
+  console.log("🎲 Отправляем в СЛУЧАЙНОМ порядке:");
+  shuffledMessages.forEach((item, index) => {
+    const time = new Date(item.message.date * 1000).toLocaleTimeString();
+    console.log(`   ${index + 1}. ${item.mapping.name} - ${time}`);
+  });
   
-  // 4. Отправляем в перемешанном порядке
+  // 3. Отправляем в СЛУЧАЙНОМ порядке
   let sentCount = 0;
   for (const item of shuffledMessages) {
-    const messageId = `${item.mapping.telegramChannel}_${item.message.id}`;
-    const messageTime = new Date(item.timestamp * 1000).toLocaleTimeString();
-    
-    console.log(`   ${item.mapping.name} - ${messageTime}`);
-    
     const success = await sendMessageToDiscord(item.mapping, item.message);
     
     if (success) {
       sentCount++;
-      botState.processedMessages[messageId] = true;
+      // Обновляем последний ID для этого канала
+      botState.lastProcessedIds[item.mapping.telegramChannel] = item.message.id;
+      
+      // Задержка между сообщениями
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
   }
   
-  // 5. Обновляем глобальное время
-  if (maxMessageTime > botState.lastGlobalTime) {
-    botState.lastGlobalTime = maxMessageTime;
-  }
+  // 4. Обновляем время проверки
+  botState.lastCheckTime = currentCheckTime;
   
+  // 5. Сохраняем состояние
   await saveBotState();
   
-  console.log(`🎉 Отправлено ${sentCount} сообщений в перемешанном порядке`);
+  console.log(`🎉 Отправлено ${sentCount} сообщений в СЛУЧАЙНОМ порядке`);
 }
 
-// Функция для перемешивания сообщений в пределах временных групп
-function shuffleWithinTimeGroups(messages) {
-  if (messages.length <= 1) return messages;
-  
-  // Группируем сообщения по временным интервалам (5 минут)
-  const timeGroups = {};
-  const TIME_WINDOW = 300; // 5 минут в секундах
-  
-  messages.forEach(msg => {
-    const timeGroup = Math.floor(msg.timestamp / TIME_WINDOW) * TIME_WINDOW;
-    if (!timeGroups[timeGroup]) {
-      timeGroups[timeGroup] = [];
-    }
-    timeGroups[timeGroup].push(msg);
-  });
-  
-  // Перемешиваем каждую группу и объединяем
-  const result = [];
-  const sortedTimeGroups = Object.keys(timeGroups).sort((a, b) => a - b);
-  
-  sortedTimeGroups.forEach(timeGroup => {
-    const groupMessages = timeGroups[timeGroup];
-    
-    // Если в группе больше 1 сообщения - перемешиваем
-    if (groupMessages.length > 1) {
-      shuffleArray(groupMessages);
-    }
-    
-    result.push(...groupMessages);
-  });
-  
-  console.log(`🔀 Перемешано ${Object.keys(timeGroups).length} временных групп`);
-  return result;
-}
-
-// Функция для перемешивания массива (Fisher-Yates shuffle)
+// Функция для настоящего случайного перемешивания
 function shuffleArray(array) {
-  for (let i = array.length - 1; i > 0; i--) {
+  const newArray = [...array];
+  for (let i = newArray.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [array[i], array[j]] = [array[j], array[i]];
+    [newArray[i], newArray[j]] = [newArray[j], newArray[i]];
   }
-  return array;
-}
-
-// Очистка старых processedMessages
-function cleanupProcessedMessages() {
-  const messageIds = Object.keys(botState.processedMessages);
-  if (messageIds.length > 3000) {
-    const toDelete = messageIds.slice(0, messageIds.length - 2000);
-    toDelete.forEach(id => {
-      delete botState.processedMessages[id];
-    });
-    console.log(`🧹 Очищено ${toDelete.length} старых записей`);
-  }
+  return newArray;
 }
 
 // Обработчики ошибок
@@ -385,9 +329,8 @@ async function startBot() {
       await checkTelegramChannels();
     }, 5000);
     
-    cron.schedule('*/2 * * * *', async () => {
+    cron.schedule('*/3 * * * *', async () => {
       console.log("🕒 Плановая проверка...");
-      cleanupProcessedMessages();
       await checkTelegramChannels();
     });
 
@@ -395,7 +338,7 @@ async function startBot() {
       await saveBotState();
     }, 60000);
     
-    console.log("🔄 Бот запущен! Проверка каждые 2 минуты.");
+    console.log("🔄 Бот запущен! Проверка каждые 3 минуты.");
     
   } catch (error) {
     console.log('❌ Ошибка запуска:', error.message);
